@@ -1,0 +1,43 @@
+{
+  "accounts": [
+    {
+      "code": "1000",
+      "name": "Cash",
+      "type": "Asset",
+      "balance": 50000
+    },
+    {
+      "code": "1100",
+      "name": "Accounts Receivable",
+      "type": "Asset",
+      "balance": 25000
+    }
+  ],
+  "customers": [
+    {
+      "code": "CUST001",
+      "name": "Test Customer 1",
+      "email": "customer1@test.com",
+      "phone": "555-0001",
+      "status": "Active"
+    }
+  ],
+  "vendors": [
+    {
+      "code": "VEND001",
+      "name": "Test Vendor 1",
+      "email": "vendor1@test.com",
+      "phone": "555-0101",
+      "status": "Active"
+    }
+  ],
+  "items": [
+    {
+      "sku": "TEST-001",
+      "name": "Test Product 1",
+      "description": "Test product description",
+      "unitPrice": 99.99,
+      "category": "Test"
+    }
+  ]
+}

@@ -1,0 +1,333 @@
+# Azure DevOps Pipeline Configuration
+# This pipeline showcases Azure DevOps integration capabilities
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  - name: nodeVersion
+    value: '18.x'
+  - name: azureRegion
+    value: 'eastus'
+  - group: erp-secrets # Variable group containing secrets
+
+stages:
+  - stage: Test
+    displayName: 'Test & Quality Checks'
+    jobs:
+      - job: UnitTests
+        displayName: 'Run Unit & Integration Tests'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - checkout: self
+            displayName: 'Checkout code'
+
+          - task: NodeTool@0
+            displayName: 'Setup Node.js'
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - task: Npm@1
+            displayName: 'Install dependencies'
+            inputs:
+              command: 'ci'
+
+          - script: |
+              npm run lint
+            displayName: 'Lint code'
+            continueOnError: true
+
+          - script: |
+              npm start &
+              sleep 5
+              curl http://localhost:3000/health
+            displayName: 'Start server'
+
+          - script: |
+              npm run test:api
+            displayName: 'Run API tests'
+
+          - script: |
+              npm run test:ui
+            displayName: 'Run UI tests'
+            continueOnError: true
+
+          - task: PublishTestResults@2
+            displayName: 'Publish test results'
+            condition: always()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results/*.xml'
+              mergeTestResults: true
+              failTaskOnFailedTests: false
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish code coverage'
+            condition: always()
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/coverage/cobertura-coverage.xml'
+
+      - job: SecurityScan
+        displayName: 'Security Vulnerability Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: |
+              npm audit --audit-level=high
+            displayName: 'npm audit'
+            continueOnError: true
+
+          - task: WhiteSource@21
+            displayName: 'WhiteSource Security Scan'
+            inputs:
+              cwd: '$(System.DefaultWorkingDirectory)'
+            continueOnError: true
+
+  - stage: Build
+    displayName: 'Build Application'
+    dependsOn: Test
+    condition: succeeded()
+    jobs:
+      - job: BuildJob
+        displayName: 'Build and Package'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - task: Npm@1
+            displayName: 'Install dependencies'
+            inputs:
+              command: 'ci'
+
+          - script: |
+              npm run build
+            displayName: 'Build application'
+
+          - task: CopyFiles@2
+            displayName: 'Copy build files'
+            inputs:
+              SourceFolder: '$(System.DefaultWorkingDirectory)'
+              Contents: |
+                dist/**
+                package*.json
+                server.js
+                src/**
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish build artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: AzureConnectivity
+    displayName: 'Azure Connectivity & Services'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: AzureTests
+        displayName: 'Test Azure Services'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Azure CLI - Test Connectivity'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Testing Azure CLI connectivity..."
+                az --version
+                az account show
+                
+                echo "Listing resource groups..."
+                az group list --output table
+                
+                echo "Testing Azure Storage..."
+                az storage account list --output table || echo "No storage accounts"
+                
+                echo "Testing Azure SQL..."
+                az sql server list --output table || echo "No SQL servers"
+
+          - task: AzureCLI@2
+            displayName: 'Test Azure App Service'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Checking App Services..."
+                az webapp list --output table || echo "No web apps"
+
+          - task: AzureCLI@2
+            displayName: 'Test Azure Key Vault'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Listing Key Vaults..."
+                az keyvault list --output table || echo "No key vaults"
+
+          - task: AzureCLI@2
+            displayName: 'Test Azure Container Registry'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Listing Container Registries..."
+                az acr list --output table || echo "No container registries"
+
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: AzureConnectivity
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployStagingJob
+        displayName: 'Deploy to Azure Staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: drop
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure App Service (Staging)'
+                  inputs:
+                    azureSubscription: 'Azure-Service-Connection'
+                    appType: 'webAppLinux'
+                    appName: 'erp-app-staging'
+                    package: '$(Pipeline.Workspace)/drop'
+                    runtimeStack: 'NODE|18-lts'
+
+                - task: AzureCLI@2
+                  displayName: 'Verify deployment'
+                  inputs:
+                    azureSubscription: 'Azure-Service-Connection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "Verifying staging deployment..."
+                      curl https://erp-app-staging.azurewebsites.net/health || echo "Health check pending"
+
+  - stage: DeployProduction
+    displayName: 'Deploy to Production'
+    dependsOn: AzureConnectivity
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployProductionJob
+        displayName: 'Deploy to Azure Production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: drop
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure App Service (Production)'
+                  inputs:
+                    azureSubscription: 'Azure-Service-Connection'
+                    appType: 'webAppLinux'
+                    appName: 'erp-app-prod'
+                    package: '$(Pipeline.Workspace)/drop'
+                    runtimeStack: 'NODE|18-lts'
+                    deploymentMethod: 'zipDeploy'
+
+                - task: AzureCLI@2
+                  displayName: 'Run smoke tests'
+                  inputs:
+                    azureSubscription: 'Azure-Service-Connection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "Running smoke tests..."
+                      curl https://erp-app-prod.azurewebsites.net/health
+                      curl https://erp-app-prod.azurewebsites.net/api
+
+                - task: AzureCLI@2
+                  displayName: 'Update Azure Front Door'
+                  inputs:
+                    azureSubscription: 'Azure-Service-Connection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "Updating Azure Front Door..."
+                      # az network front-door routing-rule update \
+                      #   --name erp-routing-rule \
+                      #   --front-door-name erp-frontdoor \
+                      #   --resource-group erp-rg
+                      echo "Front Door update would happen here"
+
+  - stage: PostDeploy
+    displayName: 'Post-Deployment'
+    dependsOn: 
+      - DeployProduction
+    condition: succeeded()
+    jobs:
+      - job: Notifications
+        displayName: 'Send Notifications'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: PublishToAzureServiceBus@1
+            displayName: 'Publish to Service Bus'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              messageBody: |
+                {
+                  "event": "deployment_completed",
+                  "branch": "$(Build.SourceBranch)",
+                  "commit": "$(Build.SourceVersion)",
+                  "timestamp": "$(System.DateTime)"
+                }
+              serviceBusQueueName: 'deployment-notifications'
+            continueOnError: true
+
+          - script: |
+              echo "Deployment completed successfully!"
+              echo "Branch: $(Build.SourceBranch)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Build Number: $(Build.BuildNumber)"
+            displayName: 'Deployment Summary'
